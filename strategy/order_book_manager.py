@@ -1,4 +1,4 @@
-"""Order book management for EdgeX and Lighter exchanges."""
+"""Order book management for EdgeX, Lighter, and GRVT exchanges."""
 import asyncio
 import logging
 from decimal import Decimal
@@ -6,7 +6,7 @@ from typing import Tuple, Optional
 
 
 class OrderBookManager:
-    """Manages order book state for both exchanges."""
+    """Manages order book state for all exchanges."""
 
     def __init__(self, logger: logging.Logger):
         """Initialize order book manager."""
@@ -23,6 +23,16 @@ class OrderBookManager:
         self.lighter_best_bid: Optional[Decimal] = None
         self.lighter_best_ask: Optional[Decimal] = None
         self.lighter_order_book_ready = False
+        self.lighter_order_book_lock = asyncio.Lock()
+        self.lighter_order_book_offset = 0
+        self.lighter_order_book_sequence_gap = False
+        self.lighter_snapshot_loaded = False
+
+        # GRVT order book state
+        self.grvt_order_book = {"bids": {}, "asks": {}}
+        self.grvt_best_bid: Optional[Decimal] = None
+        self.grvt_best_ask: Optional[Decimal] = None
+        self.grvt_order_book_ready = False
         self.lighter_order_book_offset = 0
         self.lighter_order_book_sequence_gap = False
         self.lighter_snapshot_loaded = False
@@ -157,3 +167,62 @@ class OrderBookManager:
             self.lighter_best_bid = best_bid[0]
         if best_ask is not None:
             self.lighter_best_ask = best_ask[0]
+
+    # GRVT order book methods
+    def update_grvt_order_book(self, bids: list, asks: list):
+        """Update GRVT order book with new data."""
+        # Clear and rebuild order book for full snapshot
+        if not self.grvt_order_book["bids"] and not self.grvt_order_book["asks"]:
+            self.grvt_order_book["bids"].clear()
+            self.grvt_order_book["asks"].clear()
+
+        # Process bids
+        for level in bids:
+            if isinstance(level, list) and len(level) >= 2:
+                price = Decimal(level[0])
+                size = Decimal(level[1])
+            elif isinstance(level, dict):
+                price = Decimal(level.get("price", 0))
+                size = Decimal(level.get("size", 0))
+            else:
+                continue
+
+            if size > 0:
+                self.grvt_order_book["bids"][price] = size
+            elif price in self.grvt_order_book["bids"]:
+                del self.grvt_order_book["bids"][price]
+
+        # Process asks
+        for level in asks:
+            if isinstance(level, list) and len(level) >= 2:
+                price = Decimal(level[0])
+                size = Decimal(level[1])
+            elif isinstance(level, dict):
+                price = Decimal(level.get("price", 0))
+                size = Decimal(level.get("size", 0))
+            else:
+                continue
+
+            if size > 0:
+                self.grvt_order_book["asks"][price] = size
+            elif price in self.grvt_order_book["asks"]:
+                del self.grvt_order_book["asks"][price]
+
+        # Update BBO
+        self._update_grvt_bbo()
+
+        # Mark as ready
+        if not self.grvt_order_book_ready and self.grvt_best_bid and self.grvt_best_ask:
+            self.grvt_order_book_ready = True
+            self.logger.info(f"📊 GRVT order book ready - Best bid: {self.grvt_best_bid}, Best ask: {self.grvt_best_ask}")
+
+    def _update_grvt_bbo(self):
+        """Update GRVT best bid/ask from order book."""
+        if self.grvt_order_book["bids"]:
+            self.grvt_best_bid = max(self.grvt_order_book["bids"].keys())
+        if self.grvt_order_book["asks"]:
+            self.grvt_best_ask = min(self.grvt_order_book["asks"].keys())
+
+    def get_grvt_bbo(self) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+        """Get GRVT best bid/ask prices."""
+        return self.grvt_best_bid, self.grvt_best_ask

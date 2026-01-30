@@ -1,0 +1,11 @@
+{
+  "maker_exchange": "edgex",
+  "taker_exchange": "lighter",
+  "ticker": "BTC",
+  "order_size": ".002",
+  "max_position": "0.006",
+  "long_threshold": "10",
+  "short_threshold": "10",
+  "fill_timeout": "5",
+  "use_dynamic_threshold": true
+}

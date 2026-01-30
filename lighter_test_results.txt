@@ -1,0 +1,77 @@
+Lighter Test Results
+============================================================
+[INFO] Initializing SignerClient...
+[SUCCESS] SignerClient initialized successfully
+[INFO] Creating ApiClient...
+[SUCCESS] ApiClient created successfully
+[INFO] 
+==================================================
+[INFO] Test: Get Order Books
+[INFO] ==================================================
+[INFO] Fetching order books from Lighter...
+[SUCCESS] Found 139 markets
+[INFO] 
+First 10 markets:
+[INFO]   1. ENA (ID: 29)
+[INFO]   2. AUDUSD (ID: 106)
+[INFO]   3. QQQ (ID: 129)
+[INFO]   4. HYPE (ID: 24)
+[INFO]   5. GMX (ID: 61)
+[INFO]   6. 2Z (ID: 88)
+[INFO]   7. AERO (ID: 65)
+[INFO]   8. ETH/USDC (ID: 2048)
+[INFO]   9. APEX (ID: 86)
+[INFO]   10. 1000FLOKI (ID: 19)
+[INFO] 
+BTC Market Details:
+[INFO]   Market ID: 1
+[INFO]   Market Type: perp
+[INFO]   Status: active
+[INFO]   Supported Size Decimals: 5
+[INFO]   Supported Price Decimals: 1
+[INFO]   Min Base Amount: 0.00020
+[INFO]   Taker Fee: 0.0000
+[INFO]   Maker Fee: 0.0000
+[INFO] 
+==================================================
+[INFO] Test: Get Account Info
+[INFO] ==================================================
+[INFO] Fetching account information...
+[SUCCESS] Account found!
+[ERROR] Failed to get account info: 'DetailedAccount' object has no attribute 'address'
+[ERROR] Traceback (most recent call last):
+  File "/Users/omaskate/Desktop/airdrop/cross-exchange-arbitrage/test_lighter_full.py", line 177, in test_get_account_info
+    self.log(f"  Address: {account.address}")
+                           ^^^^^^^^^^^^^^^
+  File "/opt/homebrew/lib/python3.11/site-packages/pydantic/main.py", line 1026, in __getattr__
+    raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}')
+AttributeError: 'DetailedAccount' object has no attribute 'address'
+
+[INFO] 
+==================================================
+[INFO] Test: Get Positions
+[INFO] ==================================================
+[INFO] Fetching positions...
+[SUCCESS] Found 13 positions
+[ERROR] Failed to get positions: 'AccountPosition' object has no attribute 'avg_price'
+[INFO] 
+==================================================
+[INFO] Test: Generate Auth Token
+[INFO] ==================================================
+[INFO] Generating auth token...
+[SUCCESS] Auth token generated: 1769704671:692775:3:33e0caa4a6c699fe18d958be1fee61...
+[INFO] 
+==================================================
+[INFO] Test: Get Active Orders
+[INFO] ==================================================
+[INFO] Fetching active orders...
+[SUCCESS] No active orders
+[INFO] 
+==================================================
+[INFO] Test: WebSocket Connection (with readonly=true)
+[INFO] ==================================================
+[INFO] Connecting to wss://mainnet.zklighter.elliot.ai/stream?readonly=true...
+[SUCCESS] WebSocket connected!
+[SUCCESS] Received: connected
+[SUCCESS] Subscription sent
+[SUCCESS] Received order book: subscribed/order_book

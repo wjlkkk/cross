@@ -13,16 +13,22 @@ try:
 except ImportError:
     StandxArb = None  # 如果文件不存在，防止报错，但在运行时会检查
 
+# 引入 GRVT 策略
+try:
+    from strategy.grvt_arb import GrvtArb
+except ImportError:
+    GrvtArb = None
+
 
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description='Cross-Exchange Arbitrage Bot - Supports EdgeX and StandX',
+        description='Cross-Exchange Arbitrage Bot - Supports EdgeX, StandX, and GRVT',
         formatter_class=argparse.RawDescriptionHelpFormatter
         )
 
     parser.add_argument('--exchange', type=str, default='edgex',
-                        help='Exchange to use (edgex, standx). Default: edgex')
+                        help='Exchange to use (edgex, standx, grvt). Default: edgex')
     parser.add_argument('--ticker', type=str, default='BTC',
                         help='Ticker symbol (default: BTC)')
     parser.add_argument('--size', type=str, required=True,
@@ -40,7 +46,7 @@ def parse_arguments():
 
 def validate_exchange(exchange):
     """Validate that the exchange is supported."""
-    supported_exchanges = ['edgex', 'standx']
+    supported_exchanges = ['edgex', 'standx', 'grvt']
     if exchange.lower() not in supported_exchanges:
         print(f"Error: Unsupported exchange '{exchange}'")
         print(f"Supported exchanges: {', '.join(supported_exchanges)}")
@@ -79,6 +85,13 @@ async def main():
                 return 1
             print(f"🚀 Starting StandX Arbitrage Bot for {args.ticker}...")
             bot = StandxArb(**common_params)
+
+        elif exchange_name == 'grvt':
+            if GrvtArb is None:
+                print("❌ Error: Could not import GrvtArb. Please ensure 'strategy/grvt_arb.py' exists.")
+                return 1
+            print(f"🚀 Starting GRVT Arbitrage Bot for {args.ticker}...")
+            bot = GrvtArb(**common_params)
 
         # Run the bot
         if bot:

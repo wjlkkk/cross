@@ -78,33 +78,39 @@ async def test_edgex_connection():
         try:
             metadata = await client.get_metadata()
 
-            if metadata and 'data' in metadata and 'contracts' in metadata['data']:
-                contracts = metadata['data']['contracts']
-                print(f"✅ Found {len(contracts)} available contracts:")
+            if metadata and 'data' in metadata:
+                # Check both possible response structures
+                contracts = metadata['data'].get('contracts') or metadata['data'].get('contractList', [])
+                if contracts:
+                    print(f"✅ Found {len(contracts)} available contracts:")
 
-                # Show first 5 contracts
-                for contract in list(contracts.values())[:5]:
-                    symbol = contract.get('symbol', 'N/A')
-                    contract_id = contract.get('id', 'N/A')
-                    status = contract.get('status', 'N/A')
-                    print(f"    - {symbol} (Contract ID: {contract_id}, Status: {status})")
+                    # Handle different contract formats
+                    contracts_dict = contracts if isinstance(contracts, dict) else {i: c for i, c in enumerate(contracts)}
+
+                    # Show first 5 contracts
+                    for key, contract in list(contracts_dict.items())[:5]:
+                        symbol = contract.get('symbol', contract.get('contractName', 'N/A'))
+                        contract_id = contract.get('id', contract.get('contractId', 'N/A'))
+                        status = contract.get('status', 'N/A')
+                        print(f"    - {symbol} (Contract ID: {contract_id}, Status: {status})")
 
                 if len(contracts) > 5:
                     print(f"    ... and {len(contracts) - 5} more")
 
                 # Find ETH contract for testing
                 eth_contract = None
-                for contract in contracts.values():
-                    if contract.get('symbol') == 'ETH':
+                for contract in contracts_dict.values():
+                    symbol = contract.get('symbol', contract.get('contractName', ''))
+                    if symbol == 'ETH':
                         eth_contract = contract
                         break
 
                 if eth_contract:
                     print(f"\n  ETH Contract Details:")
-                    print(f"    Symbol: {eth_contract.get('symbol')}")
-                    print(f"    Contract ID: {eth_contract.get('id')}")
-                    print(f"    Tick Size: {eth_contract.get('tick_size', 'N/A')}")
-                    print(f"    Min Order Size: {eth_contract.get('min_order_size', 'N/A')}")
+                    print(f"    Symbol: {eth_contract.get('symbol', eth_contract.get('contractName'))}")
+                    print(f"    Contract ID: {eth_contract.get('id', eth_contract.get('contractId'))}")
+                    print(f"    Tick Size: {eth_contract.get('tick_size', eth_contract.get('tickSize', 'N/A'))}")
+                    print(f"    Min Order Size: {eth_contract.get('min_order_size', eth_contract.get('minOrderSize', 'N/A'))}")
                     print(f"    Status: {eth_contract.get('status')}")
             else:
                 print("❌ No contracts found in metadata")

@@ -149,21 +149,27 @@ class WebSocketManagerWrapper:
 
     async def handle_lighter_ws(self):
         """Handle Lighter WebSocket connection and messages."""
-        url = "wss://mainnet.zklighter.elliot.ai/stream"
+        # Use readonly=true parameter for restricted regions
+        url = "wss://mainnet.zklighter.elliot.ai/stream?readonly=true"
         cleanup_counter = 0
-
+        
         while not self.stop_flag:
             timeout_count = 0
             try:
                 # Reset order book state before connecting
                 await self.order_book_manager.reset_lighter_order_book()
 
+                self.logger.info(f"🔌 Connecting to Lighter WebSocket: {url}")
+                self.logger.info(f"   Market ID: {self.lighter_market_index}, Account Index: {self.account_index}")
+
                 async with websockets.connect(url) as ws:
                     # Subscribe to order book updates
-                    await ws.send(json.dumps({
+                    subscribe_msg = {
                         "type": "subscribe",
                         "channel": f"order_book/{self.lighter_market_index}"
-                    }))
+                    }
+                    self.logger.info(f"📤 Sending subscription: {subscribe_msg}")
+                    await ws.send(json.dumps(subscribe_msg))
 
                     # Subscribe to account orders updates
                     account_orders_channel = f"account_orders/{self.lighter_market_index}/{self.account_index}"
@@ -332,10 +338,31 @@ class WebSocketManagerWrapper:
                             self.logger.error(f"⚠️ Error in Lighter websocket: {e}")
                             self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
                             break
-            except Exception as e:
-                self.logger.error(f"⚠️ Failed to connect to Lighter websocket: {e}")
 
-            await asyncio.sleep(2)
+            except Exception as e:
+                import traceback
+                error_details = str(e)
+                status_code = getattr(e, 'status_code', None)
+                
+                # Check if this is HTTP 400 - likely server-side restriction
+                if status_code == 400 or '400' in error_details:
+                    self.logger.warning(f"⚠️ Lighter WebSocket 连接被服务器拒绝 (HTTP 400): {error_details}")
+                    self.logger.warning("⚠️ 将使用 REST API 轮询获取数据")
+                else:
+                    # Try to extract more info from the exception
+                    if hasattr(e, 'response'):
+                        try:
+                            error_details += f" | Response: {e.response.text[:200]}"
+                        except:
+                            pass
+                    
+                    self.logger.warning(f"⚠️ Lighter websocket connection failed (HTTP {status_code}): {error_details}")
+                
+                # Log full traceback for debugging
+                self.logger.debug(f"Connection error traceback: {traceback.format_exc()}")
+                
+                # Reduce retry frequency to avoid spamming
+                await asyncio.sleep(10)
 
     def start_lighter_websocket(self):
         """Start Lighter WebSocket task."""

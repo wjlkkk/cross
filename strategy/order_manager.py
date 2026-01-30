@@ -499,3 +499,157 @@ class OrderManager:
     def get_edgex_client_order_id(self) -> str:
         """Get current EdgeX client order ID."""
         return self.edgex_client_order_id
+    
+    # ========== GRVT-specific methods ==========
+    
+    def set_grvt_config(self, client, contract_id: str, tick_size: Decimal):
+        """Set GRVT client and configuration."""
+        self.grvt_client = client
+        self.grvt_contract_id = contract_id
+        self.grvt_tick_size = tick_size
+    
+    async def execute_grvt_long_arbitrage(self, grvt_client, lighter_client, 
+                                          contract_id: str, quantity: Decimal,
+                                          grvt_ask: Decimal, fill_timeout: int, stop_flag):
+        """
+        Execute long arbitrage: Buy on Lighter (market), Sell on GRVT (post-only limit).
+        
+        Args:
+            grvt_client: GRVT client instance
+            lighter_client: Lighter client instance  
+            contract_id: GRVT contract ID
+            quantity: Order quantity
+            grvt_ask: GRVT ask price
+            fill_timeout: Timeout for order fill
+            stop_flag: Stop signal flag
+        
+        Returns:
+            bool: True if arbitrage executed successfully
+        """
+        try:
+            self.logger.info(f"🔄 [GRVT Long Arb] Starting...")
+            self.logger.info(f"   Lighter BUY (market) + GRVT SELL (post-only limit)")
+            
+            # Reset state
+            self.lighter_order_filled = False
+            self.order_execution_complete = False
+            
+            # Place GRVT sell order (post-only limit)
+            grvt_sell_price = grvt_ask - grvt_client.tick_size
+            grvt_sell_price = grvt_client.round_to_tick(grvt_sell_price)
+            
+            self.logger.info(f"📤 [GRVT] Placing SELL post-only order: {quantity} @ {grvt_sell_price}")
+            
+            grvt_result = await grvt_client.place_open_order(
+                contract_id=contract_id,
+                quantity=quantity,
+                direction='sell'
+            )
+            
+            if not grvt_result.success:
+                self.logger.error(f"❌ [GRVT] Failed to place sell order: {grvt_result.error_message}")
+                return False
+            
+            grvt_order_id = grvt_result.order_id
+            self.logger.info(f"✅ [GRVT] Sell order placed: {grvt_order_id}")
+            
+            # Place Lighter buy order (IOC market)
+            lighter_buy_price = grvt_ask + grvt_client.tick_size  # Slightly above ask
+            
+            self.logger.info(f"📤 [Lighter] Placing BUY IOC order: {quantity} @ {lighter_buy_price}")
+            
+            # Use the existing place_lighter_ioc_order method
+            tx_hash = await self.place_lighter_ioc_order(
+                lighter_side='buy',
+                quantity=quantity,
+                price=lighter_buy_price,
+                stop_flag=stop_flag
+            )
+            
+            if tx_hash:
+                self.logger.info(f"✅ [Lighter] Buy order filled: {tx_hash[:20]}...")
+                return True
+            else:
+                self.logger.error(f"❌ [Lighter] Buy order failed or not filled")
+                # Cancel GRVT order
+                await grvt_client.cancel_order(grvt_order_id)
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"❌ Error in GRVT long arbitrage: {e}")
+            import traceback
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
+            return False
+    
+    async def execute_grvt_short_arbitrage(self, grvt_client, lighter_client,
+                                            contract_id: str, quantity: Decimal,
+                                            grvt_bid: Decimal, fill_timeout: int, stop_flag):
+        """
+        Execute short arbitrage: Sell on Lighter (market), Buy on GRVT (post-only limit).
+        
+        Args:
+            grvt_client: GRVT client instance
+            lighter_client: Lighter client instance
+            contract_id: GRVT contract ID
+            quantity: Order quantity
+            grvt_bid: GRVT bid price
+            fill_timeout: Timeout for order fill
+            stop_flag: Stop signal flag
+        
+        Returns:
+            bool: True if arbitrage executed successfully
+        """
+        try:
+            self.logger.info(f"🔄 [GRVT Short Arb] Starting...")
+            self.logger.info(f"   Lighter SELL (market) + GRVT BUY (post-only limit)")
+            
+            # Reset state
+            self.lighter_order_filled = False
+            self.order_execution_complete = False
+            
+            # Place GRVT buy order (post-only limit)
+            grvt_buy_price = grvt_bid + grvt_client.tick_size
+            grvt_buy_price = grvt_client.round_to_tick(grvt_buy_price)
+            
+            self.logger.info(f"📤 [GRVT] Placing BUY post-only order: {quantity} @ {grvt_buy_price}")
+            
+            grvt_result = await grvt_client.place_open_order(
+                contract_id=contract_id,
+                quantity=quantity,
+                direction='buy'
+            )
+            
+            if not grvt_result.success:
+                self.logger.error(f"❌ [GRVT] Failed to place buy order: {grvt_result.error_message}")
+                return False
+            
+            grvt_order_id = grvt_result.order_id
+            self.logger.info(f"✅ [GRVT] Buy order placed: {grvt_order_id}")
+            
+            # Place Lighter sell order (IOC market)
+            lighter_sell_price = grvt_bid - grvt_client.tick_size  # Slightly below bid
+            
+            self.logger.info(f"📤 [Lighter] Placing SELL IOC order: {quantity} @ {lighter_sell_price}")
+            
+            # Use the existing place_lighter_ioc_order method
+            tx_hash = await self.place_lighter_ioc_order(
+                lighter_side='sell',
+                quantity=quantity,
+                price=lighter_sell_price,
+                stop_flag=stop_flag
+            )
+            
+            if tx_hash:
+                self.logger.info(f"✅ [Lighter] Sell order filled: {tx_hash[:20]}...")
+                return True
+            else:
+                self.logger.error(f"❌ [Lighter] Sell order failed or not filled")
+                # Cancel GRVT order
+                await grvt_client.cancel_order(grvt_order_id)
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"❌ Error in GRVT short arbitrage: {e}")
+            import traceback
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
+            return False

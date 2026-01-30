@@ -107,3 +107,48 @@ class PositionTracker:
     def get_net_position(self) -> Decimal:
         """Get net position across both exchanges."""
         return self.edgex_position + self.lighter_position
+    
+    # ========== GRVT-specific methods ==========
+    
+    def __init__(self, ticker: str, edgex_client=None, edgex_contract_id: str = None,
+                 lighter_base_url: str = None, account_index: int = 0, logger: logging.Logger = None,
+                 grvt_client=None, grvt_contract_id: str = None):
+        """Initialize position tracker with optional GRVT support."""
+        self.ticker = ticker
+        self.edgex_client = edgex_client
+        self.edgex_contract_id = edgex_contract_id
+        self.lighter_base_url = lighter_base_url
+        self.account_index = account_index
+        self.logger = logger
+        
+        # GRVT client
+        self.grvt_client = grvt_client
+        self.grvt_contract_id = grvt_contract_id
+        
+        self.edgex_position = Decimal('0')
+        self.lighter_position = Decimal('0')
+        self.grvt_position = Decimal('0')
+    
+    async def get_grvt_position(self) -> Decimal:
+        """Get GRVT position."""
+        if not self.grvt_client:
+            raise Exception("GRVT client not initialized")
+        
+        try:
+            position = await self.grvt_client.get_account_positions()
+            return position
+        except Exception as e:
+            self.logger.warning(f"⚠️ Failed to get GRVT position: {e}")
+            return Decimal('0')
+    
+    def update_grvt_position(self, delta: Decimal):
+        """Update GRVT position by delta."""
+        self.grvt_position += delta
+    
+    def get_current_grvt_position(self) -> Decimal:
+        """Get current GRVT position (cached)."""
+        return self.grvt_position
+    
+    def get_grvt_lighter_net_position(self) -> Decimal:
+        """Get net position across GRVT and Lighter exchanges."""
+        return self.grvt_position + self.lighter_position
