@@ -317,18 +317,56 @@ class GrvtArb:
         self.last_price_log_time = 0
 
     def _setup_logger(self):
-        """Setup logger with file and console output."""
+        """Setup logger with simplified file and console output."""
         self.logger = logging.getLogger(f"grvt_{self.ticker}")
         self.logger.setLevel(logging.DEBUG)
         self.logger.handlers = []
         os.makedirs('logs', exist_ok=True)
+        
+        # File handler (detailed logging)
         fh = logging.FileHandler(f'logs/grvt_{self.ticker}_log.txt')
         fh.setLevel(logging.DEBUG)
+        file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        fh.setFormatter(file_formatter)
+        
+        # Console handler (simplified logging)
         ch = logging.StreamHandler()
         ch.setLevel(logging.INFO)
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        fh.setFormatter(formatter)
-        ch.setFormatter(formatter)
+        
+        # Simplified formatter - only show prices and orders
+        def simplify_log_message(record):
+            """Simplify log message for console - only show prices and orders."""
+            msg = record.getMessage()
+            
+            # Keep only price/order related messages
+            keywords = ['price', 'bid', 'ask', 'BBO', 'order', 'fill', 'position', '📊', '💰', '✅', '❌', '🚀', '🛑']
+            if not any(kw.lower() in msg.lower() for kw in keywords):
+                return None  # Suppress this message
+            
+            # Simplify timestamp
+            import time as time_module
+            beijing_ts = time_module.time() + 28800
+            beijing_time = time_module.strftime("%H:%M:%S", time_module.gmtime(beijing_ts))
+            
+            # Add emoji prefix based on content
+            if 'BBO' in msg or 'bid' in msg.lower() or 'ask' in msg.lower():
+                return f"[{beijing_time}] 📊 {msg}"
+            elif 'order' in msg.lower() or 'fill' in msg.lower():
+                return f"[{beijing_time}] 💰 {msg}"
+            elif 'position' in msg.lower():
+                return f"[{beijing_time}] 📈 {msg}"
+            else:
+                return f"[{beijing_time}] {msg}"
+        
+        class SimplifiedFormatter(logging.Formatter):
+            def format(self, record):
+                simplified = simplify_log_message(record)
+                if simplified is None:
+                    return ""  # Suppress message
+                return simplified
+        
+        ch.setFormatter(SimplifiedFormatter())
+        
         self.logger.addHandler(fh)
         self.logger.addHandler(ch)
 

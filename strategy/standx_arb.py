@@ -127,7 +127,7 @@ class StandxArb:
         self._setup_callbacks()
 
     def _setup_logger(self):
-        """Setup logging configuration."""
+        """Setup logging configuration with simplified console output."""
         os.makedirs("logs", exist_ok=True)
         self.log_filename = f"logs/standx_{self.ticker}_log.txt"
 
@@ -140,7 +140,7 @@ class StandxArb:
         logging.getLogger('requests').setLevel(logging.WARNING)
         logging.getLogger('websockets').setLevel(logging.WARNING)
 
-        # Handlers
+        # File handler (detailed logging)
         file_handler = logging.FileHandler(self.log_filename)
         file_handler.setLevel(logging.INFO)
         
@@ -151,25 +151,47 @@ class StandxArb:
             except Exception:
                 pass
 
+        # Console handler (simplified logging)
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setLevel(logging.INFO)
 
-        # Formatters
+        # File formatter (detailed for debugging)
         file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
-        console_formatter = logging.Formatter('%(levelname)s:%(name)s:[%(filename)s:%(lineno)d]:%(message)s')
-
-        # Timezone UTC+8
-        def beijing_time(*args):
+        
+        # Console formatter (simplified - only show prices and orders)
+        def simplify_log_message(record):
+            """Simplify log message for console - only show prices and orders."""
+            msg = record.getMessage()
+            
+            # Keep only price/order related messages
+            keywords = ['price', 'bid', 'ask', 'BBO', 'order', 'fill', 'position', '📊', '💰', '✅', '❌', '🚀', '🛑']
+            if not any(kw.lower() in msg.lower() for kw in keywords):
+                return None  # Suppress this message
+            
+            # Simplify timestamp
             import time as time_module
-            utc_time = time_module.gmtime(args[0] if args else None)
-            beijing_timestamp = (args[0] if args else time_module.time()) + 28800
-            return time_module.gmtime(beijing_timestamp)
-
-        file_formatter.converter = beijing_time
-        console_formatter.converter = beijing_time
+            beijing_ts = time_module.time() + 28800
+            beijing_time = time_module.strftime("%H:%M:%S", time_module.gmtime(beijing_ts))
+            
+            # Add emoji prefix based on content
+            if 'BBO' in msg or 'bid' in msg.lower() or 'ask' in msg.lower():
+                return f"[{beijing_time}] 📊 {msg}"
+            elif 'order' in msg.lower() or 'fill' in msg.lower():
+                return f"[{beijing_time}] 💰 {msg}"
+            elif 'position' in msg.lower():
+                return f"[{beijing_time}] 📈 {msg}"
+            else:
+                return f"[{beijing_time}] {msg}"
+        
+        class SimplifiedFormatter(logging.Formatter):
+            def format(self, record):
+                simplified = simplify_log_message(record)
+                if simplified is None:
+                    return ""  # Suppress message
+                return simplified
 
         file_handler.setFormatter(file_formatter)
-        console_handler.setFormatter(console_formatter)
+        console_handler.setFormatter(SimplifiedFormatter())
 
         self.logger.addHandler(file_handler)
         self.logger.addHandler(console_handler)
