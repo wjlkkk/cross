@@ -157,7 +157,7 @@ class RobotManager:
                 self.console.print(f"[#FFD700]⚠[/] 机器人 {robot.id} 已在运行中 (PID: {robot.pid})")
                 return False
             
-            # 构建命令
+            # 构建命令 - 添加 robot_id 参数
             cmd = [
                 sys.executable,
                 "arbitrage.py",
@@ -167,6 +167,7 @@ class RobotManager:
                 "--max-position", robot.config.max_position,
                 "--long-threshold", robot.config.long_threshold,
                 "--short-threshold", robot.config.short_threshold,
+                "--robot-id", robot.id,  # 传递机器人 ID
             ]
             
             # 启动进程
@@ -263,6 +264,25 @@ class RobotManager:
                     robot.status = RobotStatus.STOPPED
                     robot.pid = None
         self.save_robots()
+    
+    def update_robot_stats(self):
+        """从统计文件更新机器人的交易数和盈亏"""
+        logs_dir = Path(__file__).parent / "logs"
+        
+        for robot_id, robot in self.robots.items():
+            stats_file = logs_dir / f"{robot_id}_stats.json"
+            
+            if stats_file.exists():
+                try:
+                    with open(stats_file, 'r', encoding='utf-8') as f:
+                        stats = json.load(f)
+                        # 更新交易数
+                        robot.stats["trades"] = stats.get("trade_count", 0)
+                        # 更新盈亏 (目前只记录交易数，盈亏需要策略层计算)
+                        robot.stats["pnl"] = stats.get("total_pnl", 0.0)
+                except Exception as e:
+                    # 忽略读取错误
+                    pass
 
 
 class ConfigManager:
@@ -312,6 +332,15 @@ class ConfigManager:
                 "api_key_private_key": os.getenv("API_KEY_PRIVATE_KEY", ""),
                 "base_url": os.getenv(f"{env_prefix}_BASE_URL", "https://mainnet.zklighter.elliot.ai"),
             }
+        elif exchange == "nado":
+            config = {
+                "wallet_address": os.getenv(f"{env_prefix}_WALLET_ADDRESS", ""),
+                "private_key": os.getenv(f"{env_prefix}_PRIVATE_KEY", ""),
+                "api_base": os.getenv(f"{env_prefix}_API_BASE", "https://gateway.prod.nado.xyz/v1"),
+                "ws_url": os.getenv(f"{env_prefix}_WS_URL", "wss://gateway.prod.nado.xyz/v1/subscribe"),
+                "chain_id": os.getenv(f"{env_prefix}_CHAIN_ID", "57073"),
+                "subaccount_name": os.getenv(f"{env_prefix}_SUBACCOUNT_NAME", "default"),
+            }
         
         return config
     
@@ -338,6 +367,8 @@ class ConfigManager:
         elif exchange == "lighter":
             return bool(config.get("account_index") is not None and 
                        os.getenv("API_KEY_PRIVATE_KEY"))
+        elif exchange == "nado":
+            return bool(config.get("wallet_address") and config.get("private_key"))
         return False
 
 
@@ -355,6 +386,7 @@ class TUIStyle:
         "standx": "#4ECDC4",       # Teal
         "grvt": "#9B59B6",         # Purple
         "lighter": "#3498DB",      # Blue
+        "nado": "#E74C3C",         # Red (Nado brand color)
         "running": "#32CD32",
         "stopped": "#666666",
         "error": "#FF4500",
@@ -386,6 +418,9 @@ class Dashboard:
         """渲染 Dashboard"""
         # 清理僵尸进程
         self.robot_manager.cleanup_zombie_robots()
+        
+        # 更新机器人统计信息
+        self.robot_manager.update_robot_stats()
         
         robots = self.robot_manager.robots
         
@@ -573,7 +608,7 @@ class ArbitrageTUI:
         # 检查交易所配置
         self.console.print("[bold]检查交易所配置...[/]\n")
         
-        exchanges = ["edgex", "grvt", "standx"]
+        exchanges = ["edgex", "grvt", "standx", "nado"]
         for ex in exchanges:
             configured = self.config.check_exchange_configured(ex)
             color = "#32CD32" if configured else "#FF4500"
@@ -589,6 +624,7 @@ class ArbitrageTUI:
             ("edgex", "lighter", "EdgeX → Lighter (经典)"),
             ("grvt", "lighter", "GRVT → Lighter (新交易所)"),
             ("edgex", "standx", "EdgeX → StandX (Solana)"),
+            ("nado", "lighter", "Nado → Lighter (Ink L2)"),
         ]
         
         for i, (m, t, desc) in enumerate(combos, 1):
@@ -815,8 +851,8 @@ class ArbitrageTUI:
         self.console.print(header)
         self.console.print("\n[bold]实时日志 (实时更新, 按 Q 返回):[/]\n")
         
-        # 读取日志文件
-        log_file = Path(__file__).parent / "logs" / f"{robot.config.maker_exchange}_{robot.config.ticker}_log.txt"
+        # 读取日志文件 - 使用 robot_id 命名的日志文件
+        log_file = Path(__file__).parent / "logs" / f"{robot.id}_arb_log.txt"
         
         if not log_file.exists():
             self.console.print(f"[dim]日志文件不存在: {log_file}[/]")
@@ -846,7 +882,8 @@ class ArbitrageTUI:
             ("2", "grvt", "GRVT"),
             ("3", "standx", "StandX"),
             ("4", "lighter", "Lighter"),
-            ("5", "返回", ""),
+            ("5", "nado", "Nado"),
+            ("6", "返回", ""),
         ]
         
         for code, ex, name in exchanges:
@@ -858,10 +895,10 @@ class ArbitrageTUI:
         
         choice = Prompt.ask("\n[bold][#00BFFF]➜[/][/] 请选择")
         
-        if choice == "5":
+        if choice == "6":
             return
         
-        exchange_map = {"1": "edgex", "2": "grvt", "3": "standx", "4": "lighter"}
+        exchange_map = {"1": "edgex", "2": "grvt", "3": "standx", "4": "lighter", "5": "nado"}
         if choice in exchange_map:
             self._edit_exchange_config(exchange_map[choice])
         
@@ -873,7 +910,8 @@ class ArbitrageTUI:
             "edgex": "EdgeX",
             "grvt": "GRVT",
             "standx": "StandX",
-            "lighter": "Lighter"
+            "lighter": "Lighter",
+            "nado": "Nado",
         }
         
         current_config = self.config.get_exchange_config(exchange)

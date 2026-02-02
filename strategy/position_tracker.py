@@ -152,3 +152,64 @@ class PositionTracker:
     def get_grvt_lighter_net_position(self) -> Decimal:
         """Get net position across GRVT and Lighter exchanges."""
         return self.grvt_position + self.lighter_position
+
+    # ========== Nado-specific methods ==========
+
+    def __init__(self, ticker: str, edgex_client=None, edgex_contract_id: str = None,
+                 lighter_base_url: str = None, account_index: int = 0, logger: logging.Logger = None,
+                 grvt_client=None, grvt_contract_id: str = None,
+                 nado_client=None, nado_product_id: int = None):
+        """Initialize position tracker with optional Nado support."""
+        self.ticker = ticker
+        self.edgex_client = edgex_client
+        self.edgex_contract_id = edgex_contract_id
+        self.lighter_base_url = lighter_base_url
+        self.account_index = account_index
+        self.logger = logger
+
+        # GRVT client
+        self.grvt_client = grvt_client
+        self.grvt_contract_id = grvt_contract_id
+
+        # Nado client
+        self.nado_client = nado_client
+        self.nado_product_id = nado_product_id
+
+        self.edgex_position = Decimal('0')
+        self.lighter_position = Decimal('0')
+        self.grvt_position = Decimal('0')
+        self.nado_position = Decimal('0')
+
+    async def get_nado_position(self) -> Decimal:
+        """Get Nado position."""
+        if not self.nado_client:
+            self.logger.warning("⚠️ Nado client not initialized, returning cached position")
+            return self.nado_position
+
+        try:
+            # Use Nado client to get position
+            # This depends on Nado API implementation
+            subaccount_info = await self.nado_client.get_subaccount_info()
+            if subaccount_info:
+                # Parse position from subaccount info
+                # Format depends on Nado API response
+                positions = subaccount_info.get('positions', [])
+                for position in positions:
+                    if position.get('symbol') == self.ticker:
+                        return Decimal(str(position.get('size', 0)))
+            return Decimal('0')
+        except Exception as e:
+            self.logger.warning(f"⚠️ Failed to get Nado position: {e}")
+            return self.nado_position
+
+    def update_nado_position(self, delta: Decimal):
+        """Update Nado position by delta."""
+        self.nado_position += delta
+
+    def get_current_nado_position(self) -> Decimal:
+        """Get current Nado position (cached)."""
+        return self.nado_position
+
+    def get_nado_lighter_net_position(self) -> Decimal:
+        """Get net position across Nado and Lighter exchanges."""
+        return self.nado_position + self.lighter_position

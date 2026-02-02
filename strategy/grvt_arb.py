@@ -22,6 +22,7 @@ from .websocket_manager import WebSocketManagerWrapper
 from .order_manager import OrderManager
 from .position_tracker import PositionTracker
 from .dynamic_threshold import DynamicThresholdCalculator
+from .trade_statistics import TradeStatistics
 from exchanges.grvt import GrvtClient
 
 
@@ -72,13 +73,12 @@ class LighterClient:
             self.api_client = ApiClient(configuration=Configuration(host=self.base_url))
             self.order_api = OrderApi(self.api_client)
             
-            # Initialize SignerClient
+            # Initialize SignerClient (same as edgex_arb.py and nado_arb.py)
             api_private_keys = {self.api_key_index: self.api_key_private_key}
             self.lighter_client = SignerClient(
                 url=self.base_url,
-                private_key=self.api_key_private_key,
                 account_index=self.account_index,
-                api_key_index=self.api_key_index,
+                api_private_keys=api_private_keys,
             )
             
             # Check client
@@ -263,7 +263,8 @@ class GrvtArb:
     def __init__(self, ticker: str, order_quantity: Decimal,
                  fill_timeout: int = 5, max_position: Decimal = Decimal('0'),
                  long_ex_threshold: Decimal = Decimal('10'),
-                 short_ex_threshold: Decimal = Decimal('10')):
+                 short_ex_threshold: Decimal = Decimal('10'),
+                 robot_id: str = None):
         """Initialize the arbitrage trading bot."""
         self.ticker = ticker
         self.order_quantity = order_quantity
@@ -271,18 +272,35 @@ class GrvtArb:
         self.max_position = max_position
         self.stop_flag = False
         self._cleanup_done = False
+        self.robot_id = robot_id or f"grvt_{ticker.lower()}"  # 使用传入的 robot_id 或默认值
 
         self.long_ex_threshold = long_ex_threshold
         self.short_ex_threshold = short_ex_threshold
+
+        # Execution lock to prevent concurrent arbitrage execution
+        self.is_executing = False
+        self.execution_lock = asyncio.Lock()
 
         # Setup logger
         self._setup_logger()
 
         # Initialize modules
-        self.data_logger = DataLogger(exchange="grvt", ticker=ticker, logger=self.logger)
+        self.data_logger = DataLogger(exchange="grvt", ticker=ticker, logger=self.logger, robot_id=self.robot_id)
         self.order_book_manager = OrderBookManager(self.logger)
         self.ws_manager = WebSocketManagerWrapper(self.order_book_manager, self.logger)
-        self.order_manager = OrderManager(self.order_book_manager, self.logger)
+        
+        # Initialize trade statistics
+        self.trade_statistics = TradeStatistics(
+            robot_id=self.robot_id,
+            ticker=self.ticker,
+            logger=self.logger
+        )
+        
+        self.order_manager = OrderManager(
+            self.order_book_manager, 
+            self.logger,
+            trade_statistics=self.trade_statistics
+        )
 
         # Initialize dynamic threshold calculator
         dynamic_window = int(os.getenv('DYNAMIC_THRESHOLD_WINDOW', '1000'))
@@ -315,16 +333,26 @@ class GrvtArb:
         # Statistics
         self.loop_count = 0
         self.last_price_log_time = 0
+        
+        # Position sync control
+        self.last_position_sync_time = None
+        self.position_sync_interval = 5  # Sync positions every 5 seconds
+        
+        # Track processed Lighter orders to prevent duplicate position updates
+        self.processed_lighter_orders = {}  # {client_order_id: last_processed_filled_amount}
 
     def _setup_logger(self):
         """Setup logger with simplified file and console output."""
-        self.logger = logging.getLogger(f"grvt_{self.ticker}")
+        os.makedirs('logs', exist_ok=True)
+        # 使用 robot_id 命名日志文件，确保每个机器人有独立的日志
+        self.log_filename = f"logs/{self.robot_id}_arb_log.txt"
+
+        self.logger = logging.getLogger(f"arbi_{self.robot_id}")
         self.logger.setLevel(logging.DEBUG)
         self.logger.handlers = []
-        os.makedirs('logs', exist_ok=True)
         
         # File handler (detailed logging)
-        fh = logging.FileHandler(f'logs/grvt_{self.ticker}_log.txt')
+        fh = logging.FileHandler(self.log_filename)
         fh.setLevel(logging.DEBUG)
         file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         fh.setFormatter(file_formatter)
@@ -443,6 +471,8 @@ class GrvtArb:
         
         # Connect to GRVT WebSocket
         try:
+            # Setup GRVT order update handler
+            self.grvt_client.setup_order_update_handler(self._handle_grvt_order_update)
             await self.grvt_client.connect()
             self.logger.info("GRVT WebSocket connected")
         except Exception as e:
@@ -473,9 +503,117 @@ class GrvtArb:
             
             if self.order_book_manager.lighter_order_book_ready:
                 self.logger.info("✅ Lighter order book data received")
+            
+            # Set WebSocket callbacks for Lighter order fills
+            self.ws_manager.set_callbacks(
+                on_lighter_order_filled=self._handle_lighter_order_filled
+            )
+            self.logger.info("✅ Lighter WebSocket callbacks configured")
         except Exception as e:
             self.logger.error(f"Failed to setup Lighter WebSocket: {e}")
             raise
+
+    def _handle_grvt_order_update(self, order_data: dict):
+        """Handle GRVT order update from WebSocket."""
+        try:
+            status = order_data.get('status', '')
+            order_id = order_data.get('order_id', '')
+            filled_size = Decimal(str(order_data.get('filled_size', 0)))
+            side = order_data.get('side', '')
+
+            if status == 'FILLED':
+                self.logger.info(f"✅ [GRVT Order FILLED] id={order_id}, side={side}, filled={filled_size}")
+                if self.order_manager:
+                    self.order_manager.grvt_order_filled = True
+                if self.position_tracker:
+                    if side == 'buy':
+                        self.position_tracker.update_grvt_position(filled_size)
+                    else:
+                        self.position_tracker.update_grvt_position(-filled_size)
+            elif status == 'CANCELED' or status == 'REJECTED':
+                self.logger.warning(f"⚠️ [GRVT Order CANCELED/REJECTED] id={order_id}, status={status}")
+            elif status == 'OPEN' or status == 'PARTIALLY_FILLED':
+                self.logger.debug(f"📋 [GRVT Order OPEN/PARTIAL] id={order_id}, status={status}, filled={filled_size}")
+                if self.position_tracker and filled_size > 0:
+                    # Update position for partial fills
+                    if side == 'buy':
+                        self.position_tracker.update_grvt_position(filled_size)
+                    else:
+                        self.position_tracker.update_grvt_position(-filled_size)
+        except Exception as e:
+            self.logger.error(f"Error handling GRVT order update: {e}")
+
+    def _handle_lighter_order_filled(self, order_data: dict):
+        """Handle Lighter order fill notification from WebSocket."""
+        try:
+            client_order_index = order_data.get("client_order_id", "UNKNOWN")
+            filled_base = Decimal(str(order_data.get("filled_base_amount", 0)))
+            
+            # Check if we've already processed this order's fill
+            # Use incremental fill tracking to prevent duplicate updates
+            if client_order_index in self.processed_lighter_orders:
+                last_processed = self.processed_lighter_orders[client_order_index]
+                # Only process incremental fill (new fill amount - last processed)
+                incremental_fill = filled_base - last_processed
+                if incremental_fill <= 0:
+                    self.logger.debug(
+                        f"📋 [Lighter Order] Order {client_order_index} already processed "
+                        f"(last={last_processed}, current={filled_base}), skipping duplicate")
+                    return
+                # Update with incremental fill
+                filled_amount_to_update = incremental_fill
+                self.logger.info(
+                    f"📋 [Lighter Order] Partial fill detected for {client_order_index}: "
+                    f"incremental={incremental_fill}, total={filled_base}")
+            else:
+                # First time processing this order
+                filled_amount_to_update = filled_base
+                if filled_base <= 0:
+                    self.logger.debug(
+                        f"📋 [Lighter Order] Order {client_order_index} has no fill yet, skipping")
+                    return
+            
+            # Calculate average filled price if not already present
+            if "avg_filled_price" not in order_data:
+                filled_quote = Decimal(str(order_data.get("filled_quote_amount", 0)))
+                if filled_base > 0:
+                    order_data["avg_filled_price"] = filled_quote / filled_base
+                else:
+                    self.logger.error("❌ Cannot calculate avg price: filled_base_amount is 0")
+                    return
+
+            # Determine side and order type
+            if order_data.get("is_ask") or order_data.get("side") == "SELL":
+                order_data["side"] = "SHORT"
+                order_type = "OPEN"
+                if self.position_tracker:
+                    self.position_tracker.update_lighter_position(-filled_amount_to_update)
+            else:
+                order_data["side"] = "LONG"
+                order_type = "CLOSE"
+                if self.position_tracker:
+                    self.position_tracker.update_lighter_position(filled_amount_to_update)
+
+            # Update processed amount for this order
+            self.processed_lighter_orders[client_order_index] = filled_base
+
+            avg_price = order_data.get("avg_filled_price", 0)
+
+            self.logger.info(
+                f"[{client_order_index}] [{order_type}] [Lighter] [FILLED]: "
+                f"{filled_amount_to_update} @ {avg_price} (total filled: {filled_base})")
+
+            # Notify order manager (only if fully filled or significant partial fill)
+            if self.order_manager:
+                # Create a copy of order_data with incremental fill amount for order_manager
+                order_data_copy = order_data.copy()
+                order_data_copy["filled_base_amount"] = str(filled_amount_to_update)
+                self.order_manager.handle_lighter_order_filled(order_data_copy)
+
+        except Exception as e:
+            self.logger.error(f"Error handling Lighter order result: {e}")
+            import traceback
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
 
     def _setup_signal_handlers(self):
         """Setup signal handlers for graceful shutdown."""
@@ -531,6 +669,42 @@ class GrvtArb:
             self.logger.error(f"Error cancelling Lighter WebSocket task: {e}")
         
         self.logger.info("Cleanup completed")
+
+    async def _sync_positions(self):
+        """Synchronize cached positions with actual positions from exchanges."""
+        try:
+            # Get actual positions from exchanges
+            actual_grvt_pos = await self.position_tracker.get_grvt_position()
+            actual_lighter_pos = await self.position_tracker.get_lighter_position()
+            
+            # Get cached positions
+            cached_grvt_pos = self.position_tracker.get_current_grvt_position()
+            cached_lighter_pos = self.position_tracker.get_current_lighter_position()
+            
+            # Check for mismatch
+            grvt_diff = abs(actual_grvt_pos - cached_grvt_pos)
+            lighter_diff = abs(actual_lighter_pos - cached_lighter_pos)
+            
+            if grvt_diff > Decimal('0.001') or lighter_diff > Decimal('0.001'):
+                self.logger.warning(
+                    f"⚠️ Position mismatch detected! "
+                    f"GRVT: cached={cached_grvt_pos}, actual={actual_grvt_pos} (diff={grvt_diff}) | "
+                    f"Lighter: cached={cached_lighter_pos}, actual={actual_lighter_pos} (diff={lighter_diff})"
+                )
+                # Update cached positions
+                self.position_tracker.grvt_position = actual_grvt_pos
+                self.position_tracker.lighter_position = actual_lighter_pos
+                self.logger.info(
+                    f"✅ [Position Sync] Updated: GRVT={actual_grvt_pos}, Lighter={actual_lighter_pos}, "
+                    f"Net={actual_grvt_pos + actual_lighter_pos}"
+                )
+            
+            self.last_position_sync_time = time.time()
+            
+        except Exception as e:
+            self.logger.error(f"❌ Position sync failed: {e}")
+            import traceback
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
 
     async def trading_loop(self):
         """Main trading loop."""
@@ -591,51 +765,126 @@ class GrvtArb:
                     self.last_price_log_time = current_time
                 
                 # Get current threshold
-                long_threshold = self.dynamic_threshold.get_long_threshold()
-                short_threshold = self.dynamic_threshold.get_short_threshold()
+                long_threshold, short_threshold = self.dynamic_threshold.get_thresholds()
                 
-                # Get current positions (GRVT + Lighter)
-                net_position = self.position_tracker.get_grvt_lighter_net_position()
-                
-                # Check max position
-                if abs(net_position) >= self.max_position:
-                    self.logger.debug(f"Max position reached: {net_position}")
-                    await asyncio.sleep(1)
+                # Check if already executing an arbitrage (prevent concurrent execution)
+                if self.is_executing:
+                    self.logger.debug("⏳ Another arbitrage is executing, skipping...")
+                    await asyncio.sleep(0.1)
                     continue
                 
-                # Long arbitrage: Lighter bid > GRVT ask + threshold
-                if long_spread > long_threshold and net_position > -self.max_position:
-                    self.logger.info(f"🚀 Long arbitrage: spread={long_spread:.2f} > threshold={long_threshold}")
-                    
-                    success = await self.order_manager.execute_grvt_long_arbitrage(
-                        grvt_client=self.grvt_client,
-                        lighter_client=self.lighter_client.lighter_client,
-                        contract_id=self.grvt_contract_id,
-                        quantity=self.order_quantity,
-                        grvt_ask=grvt_ask,
-                        fill_timeout=self.fill_timeout,
-                        stop_flag=self.stop_flag
-                    )
-                    
-                    if success:
-                        self.logger.info("✅ Long arbitrage executed successfully")
+                # Periodically sync positions from exchanges (every 5 seconds)
+                if (self.last_position_sync_time is None or 
+                    current_time - self.last_position_sync_time >= self.position_sync_interval):
+                    await self._sync_positions()
                 
-                # Short arbitrage: GRVT bid > Lighter ask + threshold
-                elif short_spread > short_threshold and net_position < self.max_position:
-                    self.logger.info(f"🚀 Short arbitrage: spread={short_spread:.2f} > threshold={short_threshold}")
-                    
-                    success = await self.order_manager.execute_grvt_short_arbitrage(
-                        grvt_client=self.grvt_client,
-                        lighter_client=self.lighter_client.lighter_client,
-                        contract_id=self.grvt_contract_id,
-                        quantity=self.order_quantity,
-                        grvt_bid=grvt_bid,
-                        fill_timeout=self.fill_timeout,
-                        stop_flag=self.stop_flag
-                    )
-                    
-                    if success:
-                        self.logger.info("✅ Short arbitrage executed successfully")
+                # Get current GRVT position (use cached for performance, sync periodically for accuracy)
+                # Reference edgex_arb.py: use single exchange position, not net position
+                current_position = self.position_tracker.get_current_grvt_position()
+                
+                # Check long opportunity
+                if long_spread > long_threshold:
+                    # Long arbitrage: Buy on GRVT (taker), Sell on Lighter (maker)
+                    # Allow if: current_position < max_position (can open long or add to existing long)
+                    if current_position < self.max_position:
+                        # Double-check position before executing (with lock)
+                        async with self.execution_lock:
+                            if self.is_executing:
+                                continue
+                            
+                            # Re-check position after acquiring lock (refresh from exchange for accuracy)
+                            await self._sync_positions()
+                            current_position_check = self.position_tracker.get_current_grvt_position()
+                            
+                            if current_position_check >= self.max_position:
+                                self.logger.info(
+                                    f"📊 [OPPORTUNITY SKIPPED] Long GRVT - Position limit reached! "
+                                    f"GRVT: bid={grvt_bid}, ask={grvt_ask} | "
+                                    f"Lighter: bid={lighter_bid}, ask={lighter_ask} | "
+                                    f"Spread={long_spread:.2f} > threshold={long_threshold:.2f} | "
+                                    f"Position={current_position_check}/{self.max_position}")
+                                continue
+                            
+                            self.is_executing = True
+                        
+                        try:
+                            self.logger.info(f"🚀 Long arbitrage: spread={long_spread:.2f} > threshold={long_threshold}, position={current_position_check}")
+                            
+                            success = await self.order_manager.execute_grvt_long_arbitrage(
+                                grvt_client=self.grvt_client,
+                                lighter_client=self.lighter_client.lighter_client,
+                                contract_id=self.grvt_contract_id,
+                                quantity=self.order_quantity,
+                                grvt_ask=grvt_ask,
+                                fill_timeout=self.fill_timeout,
+                                stop_flag=self.stop_flag
+                            )
+                            
+                            if success:
+                                self.logger.info("✅ Long arbitrage executed successfully")
+                                # Position updates are handled by WebSocket callbacks (_handle_grvt_order_update and _handle_lighter_order_filled)
+                                # Long arbitrage: GRVT BUY (+quantity), Lighter SELL (-quantity)
+                                # Net position change: +quantity - quantity = 0 (hedged)
+                                self.logger.info(
+                                    f"📊 [Position Update] After long arb: "
+                                    f"GRVT={self.position_tracker.get_current_grvt_position()}, "
+                                    f"Lighter={self.position_tracker.get_current_lighter_position()}, "
+                                    f"Net={self.position_tracker.get_grvt_lighter_net_position()}"
+                                )
+                        finally:
+                            self.is_executing = False
+                
+                # Check short opportunity
+                elif short_spread > short_threshold:
+                    # Short arbitrage: Sell on GRVT (taker), Buy on Lighter (maker)
+                    # Allow if: current_position > -max_position (can open short or add to existing short)
+                    if current_position > -1 * self.max_position:
+                        # Double-check position before executing (with lock)
+                        async with self.execution_lock:
+                            if self.is_executing:
+                                continue
+                            
+                            # Re-check position after acquiring lock (refresh from exchange for accuracy)
+                            await self._sync_positions()
+                            current_position_check = self.position_tracker.get_current_grvt_position()
+                            
+                            if current_position_check <= -1 * self.max_position:
+                                self.logger.info(
+                                    f"📊 [OPPORTUNITY SKIPPED] Short GRVT - Position limit reached! "
+                                    f"GRVT: bid={grvt_bid}, ask={grvt_ask} | "
+                                    f"Lighter: bid={lighter_bid}, ask={lighter_ask} | "
+                                    f"Spread={short_spread:.2f} > threshold={short_threshold:.2f} | "
+                                    f"Position={current_position_check}/{-1 * self.max_position}")
+                                continue
+                            
+                            self.is_executing = True
+                        
+                        try:
+                            self.logger.info(f"🚀 Short arbitrage: spread={short_spread:.2f} > threshold={short_threshold}, position={current_position_check}")
+                            
+                            success = await self.order_manager.execute_grvt_short_arbitrage(
+                                grvt_client=self.grvt_client,
+                                lighter_client=self.lighter_client.lighter_client,
+                                contract_id=self.grvt_contract_id,
+                                quantity=self.order_quantity,
+                                grvt_bid=grvt_bid,
+                                fill_timeout=self.fill_timeout,
+                                stop_flag=self.stop_flag
+                            )
+                            
+                            if success:
+                                self.logger.info("✅ Short arbitrage executed successfully")
+                                # Position updates are handled by WebSocket callbacks (_handle_grvt_order_update and _handle_lighter_order_filled)
+                                # Short arbitrage: GRVT SELL (-quantity), Lighter BUY (+quantity)
+                                # Net position change: -quantity + quantity = 0 (hedged)
+                                self.logger.info(
+                                    f"📊 [Position Update] After short arb: "
+                                    f"GRVT={self.position_tracker.get_current_grvt_position()}, "
+                                    f"Lighter={self.position_tracker.get_current_lighter_position()}, "
+                                    f"Net={self.position_tracker.get_grvt_lighter_net_position()}"
+                                )
+                        finally:
+                            self.is_executing = False
                 
                 # Update dynamic threshold with new spread observation
                 self.dynamic_threshold.add_spread_observation(long_spread, short_spread)

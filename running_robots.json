@@ -1,7 +1,7 @@
 {
   "robots": [
     {
-      "id": "edg_lig_BTC_1769879556",
+      "id": "edg_lig_BTC_1769922772",
       "config": {
         "maker_exchange": "edgex",
         "taker_exchange": "lighter",
@@ -12,7 +12,21 @@
         "short_threshold": "10",
         "fill_timeout": "5"
       },
-      "status": "stopped"
+      "status": "running"
+    },
+    {
+      "id": "grv_lig_BTC_1769922953",
+      "config": {
+        "maker_exchange": "grvt",
+        "taker_exchange": "lighter",
+        "ticker": "BTC",
+        "order_size": "0.002",
+        "max_position": "0.01",
+        "long_threshold": "10",
+        "short_threshold": "10",
+        "fill_timeout": "5"
+      },
+      "status": "running"
     }
   ]
 }

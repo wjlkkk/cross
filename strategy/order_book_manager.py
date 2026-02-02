@@ -38,6 +38,13 @@ class OrderBookManager:
         self.lighter_snapshot_loaded = False
         self.lighter_order_book_lock = asyncio.Lock()
 
+        # Nado order book state
+        self.nado_order_book = {"bids": {}, "asks": {}}
+        self.nado_best_bid: Optional[Decimal] = None
+        self.nado_best_ask: Optional[Decimal] = None
+        self.nado_order_book_ready = False
+        self.nado_bbo: Tuple[Optional[Decimal], Optional[Decimal]] = (None, None)
+
     # EdgeX order book methods
     def update_edgex_order_book(self, bids: list, asks: list):
         """Update EdgeX order book with new levels."""
@@ -226,3 +233,51 @@ class OrderBookManager:
     def get_grvt_bbo(self) -> Tuple[Optional[Decimal], Optional[Decimal]]:
         """Get GRVT best bid/ask prices."""
         return self.grvt_best_bid, self.grvt_best_ask
+
+    # Nado order book methods
+    def update_nado_order_book(self, side: str, levels: list):
+        """Update Nado order book with new levels.
+        
+        Args:
+            side: 'bids' or 'asks'
+            levels: List of [price, size] pairs
+        """
+        for level in levels:
+            if isinstance(level, list) and len(level) >= 2:
+                price = Decimal(level[0])
+                size = Decimal(level[1])
+            elif isinstance(level, dict):
+                price = Decimal(level.get("price", 0))
+                size = Decimal(level.get("size", 0))
+            else:
+                continue
+            
+            if size > 0:
+                self.nado_order_book[side][price] = size
+            elif price in self.nado_order_book[side]:
+                del self.nado_order_book[side][price]
+        
+        # Update BBO
+        self._update_nado_bbo()
+        
+        # Mark as ready
+        if not self.nado_order_book_ready and self.nado_best_bid and self.nado_best_ask:
+            self.nado_order_book_ready = True
+            self.logger.info(
+                f"📊 Nado order book ready - Best bid: {self.nado_best_bid}, Best ask: {self.nado_best_ask}")
+
+    def _update_nado_bbo(self):
+        """Update Nado best bid/ask from order book."""
+        if self.nado_order_book["bids"]:
+            self.nado_best_bid = max(self.nado_order_book["bids"].keys())
+        if self.nado_order_book["asks"]:
+            self.nado_best_ask = min(self.nado_order_book["asks"].keys())
+
+    def get_nado_bbo(self) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+        """Get Nado best bid/ask prices."""
+        return self.nado_best_bid, self.nado_best_ask
+
+    def update_nado_bbo(self):
+        """Update Nado BBO from cached values."""
+        # This method is called by WebSocket handler after order book update
+        self._update_nado_bbo()

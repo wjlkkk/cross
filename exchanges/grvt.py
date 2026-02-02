@@ -60,6 +60,17 @@ class GrvtClient(BaseExchangeClient):
         # 调用基类初始化（会设置 self.config）
         super().__init__(config)
         
+        # Initialize logger
+        import logging
+        ticker = self.ticker if hasattr(self, 'ticker') else config.get('ticker', 'GRVT') if isinstance(config, dict) else getattr(config, 'ticker', 'GRVT')
+        self.logger = logging.getLogger(f"grvt_{ticker.lower()}")
+        if not self.logger.handlers:
+            # Add console handler if no handlers exist
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+            self.logger.addHandler(handler)
+            self.logger.setLevel(logging.INFO)
+        
         # GRVT credentials - 从环境变量读取
         self.trading_account_id = os.getenv('GRVT_TRADING_ACCOUNT_ID')
         self.private_key = os.getenv('GRVT_PRIVATE_KEY')
@@ -363,22 +374,93 @@ class GrvtClient(BaseExchangeClient):
     async def place_post_only_order(self, contract_id: str, quantity: Decimal, 
                                      price: Decimal, side: str) -> OrderInfo:
         """下 post-only 限价单（Maker 单）"""
-        order_result = self.rest_client.create_limit_order(
-            symbol=contract_id,
-            side=side,
-            amount=quantity,
-            price=price,
-            params={
-                'post_only': True,
-                'order_duration_secs': 30 * 86400 - 1,
-            }
-        )
+        try:
+            order_result = self.rest_client.create_limit_order(
+                symbol=contract_id,
+                side=side,
+                amount=quantity,
+                price=price,
+                params={
+                    'post_only': True,
+                    'order_duration_secs': 30 * 86400 - 1,
+                }
+            )
+            
+            # Log full response for debugging
+            self.logger.debug(f"📋 [GRVT Order Response] Full result: {order_result}")
+            
+            # Check if response is empty (API error case - SDK returns {} on error)
+            if not order_result or order_result == {}:
+                # Check if there's error info in SDK logs or response
+                # Common errors: Insufficient margin (2080), Invalid order, etc.
+                error_msg = "GRVT API returned empty response (likely API error - check logs for details like 'Insufficient margin')"
+                self.logger.error(f"❌ [GRVT Order] {error_msg}")
+                self.logger.error(f"   This usually means: Insufficient margin, invalid order parameters, or API error")
+                raise Exception(error_msg)
+            
+            # Check for error in response (some error responses may have error field)
+            if 'error' in order_result:
+                error_msg = order_result.get('error', 'Unknown error')
+                error_code = order_result.get('code', 'N/A')
+                self.logger.error(f"❌ [GRVT Order] Error from GRVT API: {error_msg} (code: {error_code})")
+                raise Exception(f"GRVT API error: {error_msg} (code: {error_code})")
+            
+            # Check for error codes in response
+            if 'code' in order_result and order_result.get('code') != 200:
+                error_msg = order_result.get('message', 'Unknown error')
+                error_code = order_result.get('code', 'N/A')
+                self.logger.error(f"❌ [GRVT Order] Error from GRVT API: {error_msg} (code: {error_code})")
+                raise Exception(f"GRVT API error: {error_msg} (code: {error_code})")
         
-        if not order_result:
-            raise Exception(f"Error placing post-only order")
+        except Exception as e:
+            # Re-raise with more context
+            error_msg = f"Error placing post-only order: {str(e)}"
+            self.logger.error(f"❌ [GRVT Order] {error_msg}")
+            self.logger.error(f"   Contract: {contract_id}, Side: {side}, Quantity: {quantity}, Price: {price}")
+            import traceback
+            self.logger.error(f"   Traceback: {traceback.format_exc()}")
+            raise Exception(error_msg) from e
         
-        client_order_id = order_result.get('metadata').get('client_order_id')
-        order_status = order_result.get('state').get('status')
+        # Extract result from response
+        # GRVT SDK may return:
+        # 1. {'result': {...}} - wrapped format
+        # 2. {...} - direct format (order data directly)
+        # 3. {} - empty (error case, already handled above)
+        if 'result' in order_result:
+            result_data = order_result['result']
+        elif 'metadata' in order_result and 'state' in order_result:
+            # Response is already in the correct format (direct order data)
+            result_data = order_result
+        else:
+            # Try to use order_result directly if it has order-like structure
+            result_data = order_result
+        
+        if not result_data:
+            error_msg = "No result data in order response"
+            self.logger.error(f"❌ [GRVT Order] {error_msg}")
+            raise Exception(error_msg)
+        
+        # Get metadata and state
+        metadata = result_data.get('metadata')
+        state = result_data.get('state')
+        
+        if not metadata:
+            error_msg = f"No 'metadata' in result. Result data: {result_data}"
+            self.logger.error(f"❌ [GRVT Order] {error_msg}")
+            raise Exception(error_msg)
+        
+        if not state:
+            error_msg = f"No 'state' in result. Result data: {result_data}"
+            self.logger.error(f"❌ [GRVT Order] {error_msg}")
+            raise Exception(error_msg)
+        
+        client_order_id = metadata.get('client_order_id')
+        order_status = state.get('status')
+        
+        if not client_order_id:
+            error_msg = f"No 'client_order_id' in metadata. Metadata: {metadata}"
+            self.logger.error(f"❌ [GRVT Order] {error_msg}")
+            raise Exception(error_msg)
         
         # 等待订单状态更新
         order_status_start_time = time.time()

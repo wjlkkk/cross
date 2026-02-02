@@ -49,7 +49,8 @@ class StandxArb:
     def __init__(self, ticker: str, order_quantity: Decimal,
                  fill_timeout: int = 5, max_position: Decimal = Decimal('0'),
                  long_ex_threshold: Decimal = Decimal('100'),
-                 short_ex_threshold: Decimal = Decimal('100')):
+                 short_ex_threshold: Decimal = Decimal('100'),
+                 robot_id: str = None):
         """Initialize the arbitrage trading bot."""
         self.ticker = ticker
         self.order_quantity = order_quantity
@@ -57,6 +58,7 @@ class StandxArb:
         self.max_position = max_position
         self.stop_flag = False
         self._cleanup_done = False
+        self.robot_id = robot_id or f"standx_{ticker.lower()}"  # 使用传入的 robot_id 或默认值
 
         self.long_ex_threshold = long_ex_threshold
         self.short_ex_threshold = short_ex_threshold
@@ -82,7 +84,7 @@ class StandxArb:
 
         # Initialize modules
         # exchange="standx" 用于区分日志 CSV
-        self.data_logger = DataLogger(exchange="standx", ticker=ticker, logger=self.logger)
+        self.data_logger = DataLogger(exchange="standx", ticker=ticker, logger=self.logger, robot_id=self.robot_id)
         self.order_book_manager = OrderBookManager(self.logger)
         self.ws_manager = WebSocketManagerWrapper(self.order_book_manager, self.logger)
         self.order_manager = OrderManager(self.order_book_manager, self.logger)
@@ -129,9 +131,10 @@ class StandxArb:
     def _setup_logger(self):
         """Setup logging configuration with simplified console output."""
         os.makedirs("logs", exist_ok=True)
-        self.log_filename = f"logs/standx_{self.ticker}_log.txt"
+        # 使用 robot_id 命名日志文件，确保每个机器人有独立的日志
+        self.log_filename = f"logs/{self.robot_id}_arb_log.txt"
 
-        self.logger = logging.getLogger(f"arbi_standx_{self.ticker}")
+        self.logger = logging.getLogger(f"arbi_{self.robot_id}")
         self.logger.setLevel(logging.INFO)
         self.logger.handlers.clear()
 

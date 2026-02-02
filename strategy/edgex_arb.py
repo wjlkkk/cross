@@ -21,6 +21,7 @@ from .websocket_manager import WebSocketManagerWrapper
 from .order_manager import OrderManager
 from .position_tracker import PositionTracker
 from .dynamic_threshold import DynamicThresholdCalculator
+from .trade_statistics import TradeStatistics
 
 
 class Config:
@@ -36,7 +37,8 @@ class EdgexArb:
     def __init__(self, ticker: str, order_quantity: Decimal,
                  fill_timeout: int = 5, max_position: Decimal = Decimal('0'),
                  long_ex_threshold: Decimal = Decimal('10'),
-                 short_ex_threshold: Decimal = Decimal('10')):
+                 short_ex_threshold: Decimal = Decimal('10'),
+                 robot_id: str = None):
         """Initialize the arbitrage trading bot."""
         self.ticker = ticker
         self.order_quantity = order_quantity
@@ -44,6 +46,7 @@ class EdgexArb:
         self.max_position = max_position
         self.stop_flag = False
         self._cleanup_done = False
+        self.robot_id = robot_id or f"edgex_{ticker.lower()}"  # 使用传入的 robot_id 或默认值
 
         self.long_ex_threshold = long_ex_threshold
         self.short_ex_threshold = short_ex_threshold
@@ -52,10 +55,22 @@ class EdgexArb:
         self._setup_logger()
 
         # Initialize modules
-        self.data_logger = DataLogger(exchange="edgex", ticker=ticker, logger=self.logger)
+        self.data_logger = DataLogger(exchange="edgex", ticker=ticker, logger=self.logger, robot_id=self.robot_id)
         self.order_book_manager = OrderBookManager(self.logger)
         self.ws_manager = WebSocketManagerWrapper(self.order_book_manager, self.logger)
-        self.order_manager = OrderManager(self.order_book_manager, self.logger)
+        
+        # Initialize trade statistics
+        self.trade_statistics = TradeStatistics(
+            robot_id=self.robot_id,
+            ticker=self.ticker,
+            logger=self.logger
+        )
+        
+        self.order_manager = OrderManager(
+            self.order_book_manager, 
+            self.logger,
+            trade_statistics=self.trade_statistics
+        )
 
         # Initialize dynamic threshold calculator
         dynamic_window = int(os.getenv('DYNAMIC_THRESHOLD_WINDOW', '1000'))
@@ -104,6 +119,10 @@ class EdgexArb:
         self.last_skipped_log_time = None  # Control frequency of "opportunity skipped" logs
         self.bbo_log_interval = 3600  # 1 hour in seconds
         self.skipped_log_interval = 300  # 5 minutes for skipped opportunity logs
+        
+        # Opportunity logging control (prevent spam)
+        self.last_opportunity_key = None  # Track last logged opportunity to avoid spam
+        self.opportunity_log_interval = 5  # Log same opportunity at most once every 5 seconds
 
         # Position sync control (verify cached positions match actual positions)
         self.last_position_sync_time = None
@@ -112,6 +131,10 @@ class EdgexArb:
         # Position imbalance warning control (avoid log spam)
         self.last_imbalance_warning_time = None
         self.imbalance_warning_interval = 10  # Warn every 10 seconds
+
+        # Heartbeat log control (show robot is running even when no opportunities)
+        self.last_heartbeat_time = None
+        self.heartbeat_interval = 60  # 60 seconds
 
         # Price tolerance for trade execution (to avoid stale price trading)
         # If price moves more than this percentage, cancel the trade
@@ -154,9 +177,10 @@ class EdgexArb:
     def _setup_logger(self):
         """Setup logging configuration."""
         os.makedirs("logs", exist_ok=True)
-        self.log_filename = f"logs/edgex_{self.ticker}_log.txt"
+        # 使用 robot_id 命名日志文件，确保每个机器人有独立的日志
+        self.log_filename = f"logs/{self.robot_id}_arb_log.txt"
 
-        self.logger = logging.getLogger(f"arbi_{self.ticker}")
+        self.logger = logging.getLogger(f"arbi_{self.robot_id}")
         self.logger.setLevel(logging.INFO)
         self.logger.handlers.clear()
 
@@ -187,28 +211,54 @@ class EdgexArb:
         
         # Console: simplified format - only show prices and orders
         def simplify_log_message(record):
-            """Simplify log message for console - only show prices and orders."""
+            """Simplify log message for console - only show key information."""
             msg = record.getMessage()
             
-            # Keep only price/order related messages
-            keywords = ['price', 'bid', 'ask', 'BBO', 'order', 'fill', 'position', '📊', '💰', '✅', '❌', '🚀', '🛑']
-            if not any(kw.lower() in msg.lower() for kw in keywords):
-                return None  # Suppress this message
+            # 只保留以下关键信息：
+            # 1. 市场价格 (BBO)
+            # 2. 套利机会 (OPPORTUNITY)
+            # 3. 交易执行 (FILLED/FILLED)
+            # 4. 停止信号
             
-            # Simplify timestamp
+            # 过滤规则
+            show_msg = False
+            msg_type = ""
+            
+            if 'BBO' in msg or ('bid=' in msg and 'ask=' in msg):
+                # 市场价格信息
+                if 'order book ready' in msg.lower() or 'BBO' in msg:
+                    show_msg = True
+                    msg_type = "PRICE"
+            elif 'OPPORTUNITY' in msg:
+                # 套利机会信息
+                if 'SKIPPED' not in msg:
+                    show_msg = True
+                    msg_type = "ARB"
+            elif ('FILLED' in msg or 'filled' in msg.lower()) and 'Lighter' in msg:
+                # 订单成交信息
+                show_msg = True
+                msg_type = "FILL"
+            elif 'Stopping' in msg or '🛑' in msg:
+                # 停止信号
+                show_msg = True
+                msg_type = "STOP"
+            
+            if not show_msg:
+                return None  # 抑制此消息
+            
+            # 简化时间戳
             import time as time_module
             beijing_ts = time_module.time() + 28800
             beijing_time = time_module.strftime("%H:%M:%S", time_module.gmtime(beijing_ts))
             
-            # Add emoji prefix based on content
-            if 'BBO' in msg or 'bid' in msg.lower() or 'ask' in msg.lower():
-                return f"[{beijing_time}] 📊 {msg}"
-            elif 'order' in msg.lower() or 'fill' in msg.lower():
-                return f"[{beijing_time}] 💰 {msg}"
-            elif 'position' in msg.lower():
-                return f"[{beijing_time}] 📈 {msg}"
-            else:
-                return f"[{beijing_time}] {msg}"
+            # 根据消息类型添加前缀
+            prefixes = {
+                "PRICE": "📊",
+                "ARB": "💰",
+                "FILL": "✅",
+                "STOP": "🛑"
+            }
+            return f"[{beijing_time}] {prefixes.get(msg_type, '')} {msg}"
         
         class SimplifiedFormatter(logging.Formatter):
             def format(self, record):
@@ -1036,13 +1086,13 @@ class EdgexArb:
             long_ex = False
             short_ex = False
 
-            # Long opportunity: buy EdgeX, sell Lighter
+
             # - If position <= 0: we're opening or adding to long → use strict threshold
             # - If position > 0: we're already long, don't add more
             if lighter_bid and ex_best_bid and long_spread > long_threshold and current_position <= 0:
                 long_ex = True
 
-            # Short opportunity: sell EdgeX, buy Lighter
+
             # - If position >= 0: we're closing long or opening short → use relaxed threshold for closing
             # - If position < 0: we're already short, don't add more
             elif ex_best_ask and lighter_ask:
@@ -1110,17 +1160,26 @@ class EdgexArb:
                 spread = lighter_bid - ex_best_bid
                 if current_position < self.max_position:
                     # Can execute long trade
-                    self.logger.info(
-                        f"🔍 [OPPORTUNITY] Long EdgeX detected! "
-                        f"Lighter_bid={lighter_bid} - EdgeX_bid={ex_best_bid} = {spread:.2f} > threshold={long_threshold:.2f}")
-                    self.logger.info(
-                        f"💡 [Strategy] Will BUY on EdgeX @ ~{ex_best_ask} (ask-tick), "
-                        f"then SELL on Lighter @ ~{lighter_bid}")
-                    self.logger.info(
-                        f"⏱️ [Opportunity Prices] EdgeX: bid={ex_best_bid}, ask={ex_best_ask} | "
-                        f"Lighter: bid={lighter_bid}, ask={lighter_ask}")
-                    self.last_status_log_time = current_time  # Reset status log time after trade log
-                    # Pass expected prices for validation
+                    # 计算预期利润
+                    expected_profit = (lighter_bid - ex_best_ask) * self.order_quantity
+                    
+                    # 防刷屏：同一机会每5秒最多打印一次
+                    opportunity_key = f"long:{ex_best_ask}:{lighter_bid}"
+                    should_log = (
+                        self.last_opportunity_key != opportunity_key or
+                        current_time - self.last_status_log_time >= self.opportunity_log_interval
+                    )
+                    
+                    if should_log:
+                        self.logger.info(
+                            f"🔍 [OPPORTUNITY] Long EdgeX | "
+                            f"EdgeX@{ex_best_ask} → Lighter@{lighter_bid} | "
+                            f"Spread={spread:.2f} | "
+                            f"Profit≈${expected_profit:.2f}")
+                        self.last_opportunity_key = opportunity_key
+                        self.last_status_log_time = current_time
+                    
+                    # 执行交易
                     await self._execute_long_trade(expected_edgex_ask=ex_best_ask, expected_lighter_bid=lighter_bid)
                 else:
                     # Already at max long position, only log occasionally to avoid spam
@@ -1138,7 +1197,8 @@ class EdgexArb:
 
             # Check short opportunity
             elif short_ex:
-                spread = ex_best_ask - lighter_ask
+                # 做空价差：EdgeX卖出价(bid) - Lighter买入价(ask)
+                spread = ex_best_bid - lighter_ask
                 # Determine if this is a close or open trade
                 is_closing = current_position > 0
                 used_threshold = short_close_threshold if is_closing else short_threshold
@@ -1148,22 +1208,30 @@ class EdgexArb:
                     # Can execute short trade
                     # Build log message with holding time if closing
                     if is_closing and self.enable_time_based_close:
-                        time_info = f" | Holding: {holding_time_hours:.2f}h ({stage_name})"
+                        time_info = f" | Held:{holding_time_hours:.2f}h"
                     else:
                         time_info = ""
 
-                    self.logger.info(
-                        f"🔍 [OPPORTUNITY] Short EdgeX detected ({action_type})! "
-                        f"EdgeX_ask={ex_best_ask} - Lighter_ask={lighter_ask} = {spread:.2f} > threshold={used_threshold:.2f}{time_info}")
-                    self.logger.info(
-                        f"💡 [Strategy] Will SELL on EdgeX @ ~{ex_best_bid} (bid+tick), "
-                        f"then BUY on Lighter @ ~{lighter_ask}")
-                    self.logger.info(
-                        f"⏱️ [Opportunity Prices] EdgeX: bid={ex_best_bid}, ask={ex_best_ask} | "
-                        f"Lighter: bid={lighter_bid}, ask={lighter_ask} | "
-                        f"Current position={current_position}")
-                    self.last_status_log_time = current_time  # Reset status log time after trade log
-                    # Pass expected prices for validation
+                    # 计算预期利润 (做空: EdgeX卖出价 - Lighter买入价)
+                    expected_profit = (ex_best_bid - lighter_ask) * self.order_quantity
+                    
+                    # 防刷屏：同一机会每5秒最多打印一次
+                    opportunity_key = f"short:{ex_best_bid}:{lighter_ask}"
+                    should_log = (
+                        self.last_opportunity_key != opportunity_key or
+                        current_time - self.last_status_log_time >= self.opportunity_log_interval
+                    )
+                    
+                    if should_log:
+                        self.logger.info(
+                            f"🔍 [OPPORTUNITY] Short EdgeX{time_info} | "
+                            f"EdgeX@{ex_best_bid} → Lighter@{lighter_ask} | "
+                            f"Spread={spread:.2f} | "
+                            f"Profit≈${expected_profit:.2f}")
+                        self.last_opportunity_key = opportunity_key
+                        self.last_status_log_time = current_time
+                    
+                    # 执行交易
                     await self._execute_short_trade(expected_edgex_bid=ex_best_bid, expected_lighter_ask=lighter_ask)
                 else:
                     # Already at max short position, only log occasionally to avoid spam
@@ -1182,10 +1250,40 @@ class EdgexArb:
                 # No opportunity detected, add minimal sleep to prevent busy-waiting
                 await asyncio.sleep(0.01)  # 10ms instead of 50ms
 
+            # 心跳日志：每60秒输出一次状态，让用户知道机器人还在运行
+            current_time = time.time()
+            if self.last_heartbeat_time is None or (current_time - self.last_heartbeat_time >= 60):
+                try:
+                    # 获取当前市场价格
+                    ex_bbo = self.order_book_manager.get_edgex_bbo()
+                    lighter_bbo = self.order_book_manager.get_lighter_bbo()
+                    current_pos = self.position_tracker.get_current_edgex_position()
+                    
+                    if ex_bbo[0] and ex_bbo[1] and lighter_bbo[0] and lighter_bbo[1]:
+                        long_spread = lighter_bbo[0] - ex_bbo[1]
+                        short_spread = ex_bbo[0] - lighter_bbo[1]
+                        
+                        self.logger.info(
+                            f"💓 [Heartbeat] Running | "
+                            f"EdgeX: {ex_bbo[0]}/{ex_bbo[1]} | "
+                            f"Lighter: {lighter_bbo[0]}/{lighter_bbo[1]} | "
+                            f"Spreads: Long={float(long_spread):.2f}, Short={float(short_spread):.2f} | "
+                            f"Position: {current_pos}"
+                        )
+                    else:
+                        self.logger.info(
+                            f"💓 [Heartbeat] Running | Waiting for market data... | "
+                            f"Position: {current_pos}"
+                        )
+                except Exception as e:
+                    self.logger.debug(f"Heartbeat log error (ignored): {e}")
+                
+                self.last_heartbeat_time = current_time
+
     async def _execute_long_trade(self, expected_edgex_ask=None, expected_lighter_bid=None):
         """Execute a long trade (buy on EdgeX, sell on Lighter)."""
         trade_start_time = time.time()
-        self.logger.info(f"⏱️ LONG TRADE START")
+        self.logger.info(f"⏱️ LONG TRADE START | Size={self.order_quantity}")
 
         # Record position open time if opening a new position
         if self.position_tracker.get_current_edgex_position() == 0:
@@ -1325,10 +1423,24 @@ class EdgexArb:
                     self.logger.info("⏳ 等待持仓更新...")
                     await asyncio.sleep(2)
 
-            # 触发关闭流程
-            self.logger.error("🛑 由于错误，触发关闭流程...")
-            self.stop_flag = True
-            return
+            # 根据错误类型决定是否继续运行
+            # 对于速率限制等可恢复错误，继续运行
+            # 对于致命错误，停止机器人
+            is_fatal_error = (
+                "DEADLINE_EXCEEDED" in error_msg and
+                not timeout_order_found  # 如果订单已经处理完成，不是致命错误
+            )
+            
+            if is_fatal_error:
+                # 致命错误，停止机器人
+                self.logger.error("🛑 由于致命错误，触发关闭流程...")
+                self.stop_flag = True
+                return
+            else:
+                # 可恢复错误（如速率限制），记录日志并继续
+                self.logger.warning(f"⚠️ 可恢复错误: {e}")
+                self.logger.info("💡 继续运行...")
+                return
 
         start_time = time.time()
         while not self.order_manager.order_execution_complete and not self.stop_flag:
@@ -1419,7 +1531,7 @@ class EdgexArb:
     async def _execute_short_trade(self, expected_edgex_bid=None, expected_lighter_ask=None):
         """Execute a short trade (sell on EdgeX, buy on Lighter)."""
         trade_start_time = time.time()
-        self.logger.info(f"⏱️ SHORT TRADE START")
+        self.logger.info(f"⏱️ SHORT TRADE START | Size={self.order_quantity}")
 
         # Check if this is closing a long position or opening a short position
         current_position = self.position_tracker.get_current_edgex_position()
@@ -1568,10 +1680,24 @@ class EdgexArb:
                     self.logger.info("⏳ 等待持仓更新...")
                     await asyncio.sleep(2)
 
-            # 触发关闭流程
-            self.logger.error("🛑 由于错误，触发关闭流程...")
-            self.stop_flag = True
-            return
+            # 根据错误类型决定是否继续运行
+            # 对于速率限制等可恢复错误，继续运行
+            # 对于致命错误，停止机器人
+            is_fatal_error = (
+                "DEADLINE_EXCEEDED" in error_msg and
+                not timeout_order_found  # 如果订单已经处理完成，不是致命错误
+            )
+            
+            if is_fatal_error:
+                # 致命错误，停止机器人
+                self.logger.error("🛑 由于致命错误，触发关闭流程...")
+                self.stop_flag = True
+                return
+            else:
+                # 可恢复错误（如速率限制），记录日志并继续
+                self.logger.warning(f"⚠️ 可恢复错误: {e}")
+                self.logger.info("💡 继续运行...")
+                return
 
         start_time = time.time()
         while not self.order_manager.order_execution_complete and not self.stop_flag:
@@ -1608,6 +1734,10 @@ class EdgexArb:
             self.logger.info("\n🛑 Received interrupt signal...")
         except asyncio.CancelledError:
             self.logger.info("\n🛑 Task cancelled...")
+        except Exception as e:
+            self.logger.error(f"❌ Trading loop error: {e}")
+            import traceback
+            self.logger.error(f"Full traceback: {traceback.format_exc()}")
         finally:
             self.logger.info("🔄 Cleaning up...")
             self.shutdown()

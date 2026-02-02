@@ -19,16 +19,22 @@ try:
 except ImportError:
     GrvtArb = None
 
+# 引入 Nado 策略
+try:
+    from strategy.nado_arb import NadoArb
+except ImportError:
+    NadoArb = None
+
 
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description='Cross-Exchange Arbitrage Bot - Supports EdgeX, StandX, and GRVT',
+        description='Cross-Exchange Arbitrage Bot - Supports EdgeX, StandX, GRVT, and Nado',
         formatter_class=argparse.RawDescriptionHelpFormatter
         )
 
     parser.add_argument('--exchange', type=str, default='edgex',
-                        help='Exchange to use (edgex, standx, grvt). Default: edgex')
+                        help='Exchange to use (edgex, standx, grvt, nado). Default: edgex')
     parser.add_argument('--ticker', type=str, default='BTC',
                         help='Ticker symbol (default: BTC)')
     parser.add_argument('--size', type=str, required=True,
@@ -41,12 +47,14 @@ def parse_arguments():
                         help='Long threshold for exchange (default: 10). Note: Ignored if USE_DYNAMIC_THRESHOLD=true')
     parser.add_argument('--short-threshold', type=Decimal, default=Decimal('10'),
                         help='Short threshold for exchange (default: 10). Note: Ignored if USE_DYNAMIC_THRESHOLD=true')
+    parser.add_argument('--robot-id', type=str, default=None,
+                        help='Unique robot ID for logging and identification')
     return parser.parse_args()
 
 
 def validate_exchange(exchange):
     """Validate that the exchange is supported."""
-    supported_exchanges = ['edgex', 'standx', 'grvt']
+    supported_exchanges = ['edgex', 'standx', 'grvt', 'nado']
     if exchange.lower() not in supported_exchanges:
         print(f"Error: Unsupported exchange '{exchange}'")
         print(f"Supported exchanges: {', '.join(supported_exchanges)}")
@@ -64,6 +72,7 @@ async def main():
 
     bot = None
     exchange_name = args.exchange.lower()
+    robot_id = args.robot_id or f"{exchange_name}_{args.ticker.lower()}"  # 使用传入的 robot_id 或默认值
 
     try:
         common_params = {
@@ -72,7 +81,8 @@ async def main():
             'fill_timeout': args.fill_timeout,
             'max_position': args.max_position,
             'long_ex_threshold': Decimal(args.long_threshold),
-            'short_ex_threshold': Decimal(args.short_threshold)
+            'short_ex_threshold': Decimal(args.short_threshold),
+            'robot_id': robot_id,  # 传递 robot_id
         }
 
         if exchange_name == 'edgex':
@@ -92,6 +102,13 @@ async def main():
                 return 1
             print(f"🚀 Starting GRVT Arbitrage Bot for {args.ticker}...")
             bot = GrvtArb(**common_params)
+
+        elif exchange_name == 'nado':
+            if NadoArb is None:
+                print("❌ Error: Could not import NadoArb. Please ensure 'strategy/nado_arb.py' exists.")
+                return 1
+            print(f"🚀 Starting Nado Arbitrage Bot for {args.ticker}...")
+            bot = NadoArb(**common_params)
 
         # Run the bot
         if bot:

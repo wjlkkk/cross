@@ -11,16 +11,25 @@ import pytz
 class DataLogger:
     """Handles CSV and JSON logging for trades and BBO data."""
 
-    def __init__(self, exchange: str, ticker: str, logger: logging.Logger):
+    def __init__(self, exchange: str, ticker: str, logger: logging.Logger, robot_id: str = None):
         """Initialize data logger with file paths."""
         self.exchange = exchange
         self.ticker = ticker
         self.logger = logger
+        self.robot_id = robot_id
         os.makedirs("logs", exist_ok=True)
 
         self.csv_filename = f"logs/{exchange}_{ticker}_trades.csv"
         self.bbo_csv_filename = f"logs/{exchange}_{ticker}_bbo_data.csv"
         self.thresholds_json_filename = f"logs/{exchange}_{ticker}_thresholds.json"
+        
+        # 共享统计文件路径 (用于 TUI 控制台读取)
+        self.stats_json_filename = f"logs/{robot_id}_stats.json" if robot_id else None
+        
+        # 初始化统计
+        self.trade_count = 0
+        self.total_pnl = Decimal('0')
+        self._load_stats()
 
         # CSV file handles for efficient writing (kept open)
         self.bbo_csv_file = None
@@ -39,6 +48,39 @@ class DataLogger:
 
         self._initialize_trade_csv_file()
         self._initialize_bbo_csv_file()
+    
+    def _load_stats(self):
+        """Load stats from JSON file if exists."""
+        if not self.stats_json_filename:
+            return
+        
+        try:
+            if os.path.exists(self.stats_json_filename):
+                with open(self.stats_json_filename, 'r', encoding='utf-8') as f:
+                    stats = json.load(f)
+                    self.trade_count = stats.get('trade_count', 0)
+                    self.total_pnl = Decimal(str(stats.get('total_pnl', '0')))
+        except Exception as e:
+            self.logger.warning(f"Failed to load stats: {e}")
+    
+    def _save_stats(self):
+        """Save stats to JSON file for TUI console to read."""
+        if not self.stats_json_filename:
+            return
+        
+        try:
+            stats = {
+                'trade_count': self.trade_count,
+                'total_pnl': float(self.total_pnl),
+                'last_update': datetime.now().isoformat()
+            }
+            # 使用临时文件然后重命名，避免写入过程中的读取问题
+            temp_file = self.stats_json_filename + '.tmp'
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(stats, f, indent=2)
+            os.rename(temp_file, self.stats_json_filename)
+        except Exception as e:
+            self.logger.warning(f"Failed to save stats: {e}")
 
     def _initialize_trade_csv_file(self):
         """Initialize trade CSV file with headers if it doesn't exist."""
@@ -94,9 +136,12 @@ class DataLogger:
             self.trade_csv_writer.writerow([exchange, timestamp, side, price, quantity])
             self.trade_write_counter += 1
 
-            # Initialize timestamp on first write
-            if self.last_trade_flush_time is None:
-                self.last_trade_flush_time = time.time()
+            # 更新交易统计
+            self.trade_count += 1
+            
+            # 计算 PnL (简化估算: 假设每笔交易利润与数量相关)
+            # 实际 PnL 需要更复杂的计算，这里提供交易次数
+            # PnL 计算应该在策略层完成，这里只记录次数
 
             # Flush every N trades or every 30 seconds
             current_time = time.time()
@@ -105,9 +150,11 @@ class DataLogger:
                 self.trade_csv_file.flush()
                 self.trade_write_counter = 0
                 self.last_trade_flush_time = current_time
-                #biwii self.logger.info(f"💾 Trade CSV flushed to disk")
 
-            self.logger.info(f"📊 Trade logged to CSV: {exchange} {side} {quantity} @ {price}")
+            # 保存统计文件
+            self._save_stats()
+
+            # Trade logged to CSV
         except Exception as e:
             self.logger.error(f"Error writing trade to CSV: {e}")
             # Try to reinitialize on error
